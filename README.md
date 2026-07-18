@@ -19,11 +19,13 @@ so you can **configure an existing provider** or **build your own**.
   - [2. Author lookup](#2-author-lookup)
   - [3. File ID lookup (optional)](#3-file-id-lookup-optional)
 - [The response contract](#the-response-contract)
+  - [Required fields](#required-fields)
   - [Avatar object schema](#avatar-object-schema)
 - [Using a provider in VRCX](#using-a-provider-in-vrcx)
 - [Building your own provider](#building-your-own-provider)
-  - [Minimal Node.js / Express example](#minimal-nodejs--express-example)
-  - [Minimal Python / Flask example](#minimal-python--flask-example)
+  - [Node.js / Express example](#nodejs--express-example)
+  - [Rust / Axum example](#rust--axum-example)
+  - [C# / ASP.NET Core example](#c--aspnet-core-example)
 - [Behavior & edge cases](#behavior--edge-cases)
 - [Quick checklist](#quick-checklist)
 - [FAQ](#faq)
@@ -145,8 +147,41 @@ For **all** modes, VRCX requires:
 Anything else (non‑200, invalid JSON, non‑object) is treated as an error.
 
 VRCX merges each returned object **on top of a set of defaults**, so any field you omit falls
-back to a sensible empty value. You only strictly need to provide the fields you actually have —
-but every avatar **must** have a unique **`id`** (VRCX keys and de‑duplicates results by it).
+back to a sensible empty value. See [Required fields](#required-fields) for what you actually
+need to send.
+
+### Required fields
+
+The API contract is deliberately forgiving. In the source, every response object is spread over a
+full set of defaults:
+
+```js
+const ref = {
+    authorId: '', authorName: '', name: '', description: '',
+    id: '', imageUrl: '', thumbnailImageUrl: '',
+    created_at: '0001-01-01T00:00:00.0000000Z',
+    updated_at: '0001-01-01T00:00:00.0000000Z',
+    releaseStatus: 'public',
+    ...avatar   // <-- your data overrides the defaults
+};
+```
+
+Because of this, **no missing field will cause an error** — VRCX just uses the default. The only
+*structural* requirement is a valid JSON response with HTTP `200` (an array for `search`/`authorId`,
+a single object for `fileId`).
+
+But "won't error" isn't "will work." In practice:
+
+| Field | Required? | Why |
+| --- | --- | --- |
+| **`id`** | ✅ **Yes — always** | It is the map key (`avatars.set(ref.id, ref)`) and the de‑duplication key. Without it, **every** result collapses onto the empty‑string key `''`, so VRCX effectively keeps only one avatar. This is the one field you must always send. |
+| **`name`** | ⚠️ For search | It's what the user sees and the whole point of a search hit. An unnamed result is useless. |
+| **`authorId`** | ⚠️ For author lookup | Needed for the `?authorId=` mode to return/link correctly and to merge results across providers. |
+| **`imageUrl`** | ⚠️ For "find avatar" | Used in the `fileId` fallback match: `extractFileId(avatar.imageUrl) === fileId`. Without it, resolving an avatar from a player's image can't match. |
+| `authorName`, `description`, `thumbnailImageUrl`, `releaseStatus`, `created_at`, `updated_at` | ❌ Optional | Defaults are applied automatically. |
+
+**Bottom line:** the only field the code truly *needs* is **`id`**. For a genuinely functional
+provider, send **`id` + `name` + `authorId` + `imageUrl`**; everything else is optional polish.
 
 ### Avatar object schema
 
@@ -232,9 +267,11 @@ query, which is handy while testing your own endpoint.
 
 You need a single HTTP GET endpoint that branches on the `search`, `authorId`, and (optionally)
 `fileId` query parameters and returns the JSON described above. Any language/stack works — below
-are two minimal, illustrative reference implementations backed by an in‑memory list.
+are three minimal, illustrative reference implementations backed by an in‑memory list. Each one
+always sends the truly required **`id`** plus the functional **`name` / `authorId` / `imageUrl`**
+(see [Required fields](#required-fields)).
 
-### Minimal Node.js / Express example
+### Node.js / Express example
 
 ```js
 // server.js — illustrative reference provider
@@ -245,7 +282,7 @@ const app = express();
 // Your index. In production this is a database of crowd‑sourced avatars.
 const AVATARS = [
   {
-    id: 'avtr_11111111-1111-1111-1111-111111111111',
+    id: 'avtr_11111111-1111-1111-1111-111111111111', // REQUIRED
     name: 'Neon Fox',
     description: 'A glowing fox avatar',
     authorId: 'usr_22222222-2222-2222-2222-222222222222',
@@ -293,59 +330,175 @@ app.listen(3000, () => console.log('provider on http://localhost:3000/avatars'))
 
 Configure VRCX to point at `http://your-host:3000/avatars`.
 
-### Minimal Python / Flask example
+### Rust / Axum example
 
-```python
-# app.py — illustrative reference provider
-import re
-from flask import Flask, request, jsonify
+```rust
+// main.rs — illustrative reference provider
+// Cargo.toml deps: axum = "0.7", tokio = { version = "1", features = ["full"] },
+//                  serde = { version = "1", features = ["derive"] }, serde_json = "1"
+use axum::{extract::Query, response::IntoResponse, routing::get, Json, Router};
+use serde::Serialize;
+use std::collections::HashMap;
 
-app = Flask(__name__)
+#[derive(Clone, Serialize)]
+struct Avatar {
+    id: String, // REQUIRED
+    name: String,
+    description: String,
+    #[serde(rename = "authorId")]
+    author_id: String,
+    #[serde(rename = "authorName")]
+    author_name: String,
+    #[serde(rename = "imageUrl")]
+    image_url: String,
+    #[serde(rename = "thumbnailImageUrl")]
+    thumbnail_image_url: String,
+    #[serde(rename = "releaseStatus")]
+    release_status: String,
+    created_at: String,
+    updated_at: String,
+}
 
-AVATARS = [
-    {
-        "id": "avtr_11111111-1111-1111-1111-111111111111",
-        "name": "Neon Fox",
-        "description": "A glowing fox avatar",
-        "authorId": "usr_22222222-2222-2222-2222-222222222222",
-        "authorName": "FoxMaker",
-        "imageUrl": "https://api.vrchat.cloud/api/1/file/file_aaaa/1/file",
-        "thumbnailImageUrl": "https://api.vrchat.cloud/api/1/image/file_aaaa/1/256",
-        "releaseStatus": "public",
-        "created_at": "2023-02-14T12:00:00.0000000Z",
-        "updated_at": "2023-08-01T09:30:00.0000000Z",
+fn index() -> Vec<Avatar> {
+    vec![Avatar {
+        id: "avtr_11111111-1111-1111-1111-111111111111".into(),
+        name: "Neon Fox".into(),
+        description: "A glowing fox avatar".into(),
+        author_id: "usr_22222222-2222-2222-2222-222222222222".into(),
+        author_name: "FoxMaker".into(),
+        image_url: "https://api.vrchat.cloud/api/1/file/file_aaaa/1/file".into(),
+        thumbnail_image_url: "https://api.vrchat.cloud/api/1/image/file_aaaa/1/256".into(),
+        release_status: "public".into(),
+        created_at: "2023-02-14T12:00:00.0000000Z".into(),
+        updated_at: "2023-08-01T09:30:00.0000000Z".into(),
+    }]
+}
+
+// Pull the VRChat file ID out of an image URL: .../file/file_aaaa/1/file -> file_aaaa
+fn file_id_of(url: &str) -> Option<&str> {
+    let start = url.find("file_")?;
+    let rest = &url[start..];
+    let end = rest.find('/').unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
+async fn avatars(Query(q): Query<HashMap<String, String>>) -> impl IntoResponse {
+    let data = index();
+
+    // Mode 3: file ID lookup -> single object (or 404 to opt out)
+    if let Some(file_id) = q.get("fileId") {
+        return match data.iter().find(|a| file_id_of(&a.image_url) == Some(file_id.as_str())) {
+            Some(a) => Json(a.clone()).into_response(),
+            None => axum::http::StatusCode::NOT_FOUND.into_response(),
+        };
     }
-]
 
-def file_id_of(url: str):
-    m = re.search(r"file_[0-9A-Za-z-]+", url or "")
-    return m.group(0) if m else None
+    // Mode 2: author lookup -> array
+    if let Some(author_id) = q.get("authorId") {
+        let hits: Vec<_> = data.into_iter().filter(|a| &a.author_id == author_id).collect();
+        return Json(hits).into_response();
+    }
 
-@app.get("/avatars")
-def avatars():
-    search = request.args.get("search")
-    author_id = request.args.get("authorId")
-    file_id = request.args.get("fileId")
-    n = int(request.args.get("n", 5000))
+    // Mode 1: search -> array (respect the n cap)
+    if let Some(search) = q.get("search") {
+        let needle = search.to_lowercase();
+        let limit: usize = q.get("n").and_then(|v| v.parse().ok()).unwrap_or(5000);
+        let hits: Vec<_> = data
+            .into_iter()
+            .filter(|a| a.name.to_lowercase().contains(&needle))
+            .take(limit)
+            .collect();
+        return Json(hits).into_response();
+    }
 
-    # Mode 3: file ID lookup -> single object (or 404 to opt out)
-    if file_id:
-        hit = next((a for a in AVATARS if file_id_of(a["imageUrl"]) == file_id), None)
-        return (jsonify(hit), 200) if hit else ("", 404)
+    axum::http::StatusCode::BAD_REQUEST.into_response()
+}
 
-    # Mode 2: author lookup -> array
-    if author_id:
-        return jsonify([a for a in AVATARS if a["authorId"] == author_id])
+#[tokio::main]
+async fn main() {
+    let app = Router::new().route("/avatars", get(avatars));
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    println!("provider on http://localhost:3000/avatars");
+    axum::serve(listener, app).await.unwrap();
+}
+```
 
-    # Mode 1: search -> array (respect the n cap)
-    if search:
-        q = search.lower()
-        return jsonify([a for a in AVATARS if q in a["name"].lower()][:n])
+### C# / ASP.NET Core example
 
-    return jsonify({"error": "missing query parameter"}), 400
+```csharp
+// Program.cs — illustrative reference provider (.NET 8 minimal API)
+using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 
-if __name__ == "__main__":
-    app.run(port=3000)
+var builder = WebApplication.CreateBuilder(args);
+builder.Services.ConfigureHttpJsonOptions(o =>
+    o.SerializerOptions.DefaultIgnoreCondition = JsonIgnoreCondition.Never);
+var app = builder.Build();
+
+// Your index. In production this is a database of crowd‑sourced avatars.
+var avatars = new List<Avatar>
+{
+    new()
+    {
+        Id = "avtr_11111111-1111-1111-1111-111111111111", // REQUIRED
+        Name = "Neon Fox",
+        Description = "A glowing fox avatar",
+        AuthorId = "usr_22222222-2222-2222-2222-222222222222",
+        AuthorName = "FoxMaker",
+        ImageUrl = "https://api.vrchat.cloud/api/1/file/file_aaaa/1/file",
+        ThumbnailImageUrl = "https://api.vrchat.cloud/api/1/image/file_aaaa/1/256",
+        ReleaseStatus = "public",
+        CreatedAt = "2023-02-14T12:00:00.0000000Z",
+        UpdatedAt = "2023-08-01T09:30:00.0000000Z"
+    }
+};
+
+// Pull the VRChat file ID out of an image URL: .../file/file_aaaa/1/file -> file_aaaa
+static string? FileIdOf(string url) =>
+    Regex.Match(url ?? "", "file_[0-9A-Za-z-]+") is { Success: true } m ? m.Value : null;
+
+app.MapGet("/avatars", (string? search, string? authorId, string? fileId, int? n) =>
+{
+    // Mode 3: file ID lookup -> single object (or 404 to opt out)
+    if (fileId is not null)
+    {
+        var hit = avatars.FirstOrDefault(a => FileIdOf(a.ImageUrl) == fileId);
+        return hit is null ? Results.NotFound() : Results.Json(hit);
+    }
+
+    // Mode 2: author lookup -> array
+    if (authorId is not null)
+        return Results.Json(avatars.Where(a => a.AuthorId == authorId));
+
+    // Mode 1: search -> array (respect the n cap)
+    if (search is not null)
+    {
+        var limit = n ?? 5000;
+        var hits = avatars
+            .Where(a => a.Name.Contains(search, StringComparison.OrdinalIgnoreCase))
+            .Take(limit);
+        return Results.Json(hits);
+    }
+
+    return Results.BadRequest(new { error = "missing query parameter" });
+});
+
+app.Run("http://0.0.0.0:3000");
+
+// VRCX expects VRChat's lowerCamelCase JSON keys, so map the property names explicitly.
+class Avatar
+{
+    [JsonPropertyName("id")]                public string Id { get; set; } = "";
+    [JsonPropertyName("name")]              public string Name { get; set; } = "";
+    [JsonPropertyName("description")]       public string Description { get; set; } = "";
+    [JsonPropertyName("authorId")]          public string AuthorId { get; set; } = "";
+    [JsonPropertyName("authorName")]        public string AuthorName { get; set; } = "";
+    [JsonPropertyName("imageUrl")]          public string ImageUrl { get; set; } = "";
+    [JsonPropertyName("thumbnailImageUrl")] public string ThumbnailImageUrl { get; set; } = "";
+    [JsonPropertyName("releaseStatus")]     public string ReleaseStatus { get; set; } = "public";
+    [JsonPropertyName("created_at")]        public string CreatedAt { get; set; } = "0001-01-01T00:00:00.0000000Z";
+    [JsonPropertyName("updated_at")]        public string UpdatedAt { get; set; } = "0001-01-01T00:00:00.0000000Z";
+}
 ```
 
 ---
